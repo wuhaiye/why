@@ -5,6 +5,8 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+# This workflow auto-enables Pages for first-time repos.
+
 permissions:
   contents: read
   pages: write
@@ -35,6 +37,8 @@ jobs:
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
