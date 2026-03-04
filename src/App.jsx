@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, Box, ChefHat, ChevronDown, Search, TrendingUp, X } from 'lucide-react'
+import { ArrowLeft, Box, ChefHat, ChevronDown, Info, Search, X } from 'lucide-react'
 
 function toDateValue(date) {
   const year = date.getFullYear()
@@ -14,7 +14,7 @@ function createRecentDateOptions() {
   for (let offset = 0; offset < 7; offset += 1) {
     const date = new Date()
     date.setHours(0, 0, 0, 0)
-    date.setDate(date.getDate() - offset)
+    date.setDate(date.getDate() + offset)
 
     const value = toDateValue(date)
     let label = value.replace(/-/g, '/')
@@ -22,7 +22,7 @@ function createRecentDateOptions() {
     if (offset === 0) {
       label += '（今日）'
     } else if (offset === 1) {
-      label += '（昨日）'
+      label += '（明日）'
     }
 
     options.push({ value, label })
@@ -84,11 +84,65 @@ const ITEM_TEMPLATES = [
 ]
 
 const LIST_PAGE_SIZE = 8
+const FORECAST_PAGE_SIZE = 6
 
 const STOCK_STATE_PRIORITY = {
   out: 0,
   warning: 1,
   normal: 2,
+}
+
+const FORECAST_CATEGORY_OPTIONS = {
+  dish: [
+    { id: 'all', label: '全部' },
+    { id: 'add-on', label: '加料' },
+    { id: 'hot', label: '热菜' },
+    { id: 'cold', label: '凉菜' },
+    { id: 'staple', label: '主食' },
+    { id: 'soup', label: '汤羹' },
+  ],
+  item: [
+    { id: 'all', label: '全部' },
+    { id: 'semi', label: '半成品' },
+    { id: 'sauce', label: '酱料' },
+    { id: 'base', label: '底料' },
+    { id: 'pack', label: '包装' },
+  ],
+}
+
+const DISH_CATEGORY_MAP = {
+  d1: 'hot',
+  d2: 'hot',
+  d3: 'soup',
+  d4: 'add-on',
+  d5: 'hot',
+  d6: 'hot',
+  d7: 'hot',
+  d8: 'staple',
+  d9: 'hot',
+  d10: 'hot',
+  d11: 'add-on',
+  d12: 'cold',
+}
+
+const ITEM_CATEGORY_MAP = {
+  i1: 'semi',
+  i2: 'base',
+  i3: 'semi',
+  i4: 'sauce',
+  i5: 'semi',
+  i6: 'sauce',
+  i7: 'base',
+  i8: 'base',
+  i9: 'base',
+  i10: 'sauce',
+  i11: 'pack',
+  i12: 'sauce',
+}
+
+const FORECAST_STEP_TIPS = {
+  step1: '至少需要有历史1个月的营业数据。预估营业额为总营业额。基于历史堂食、外卖等所有渠道营业额进行预估',
+  step2: '至少需要有历史1个月的营业数据。若外卖菜品已关联堂食菜品，菜品预估销量包含外卖销量',
 }
 
 function composeKey(date, slot) {
@@ -164,6 +218,28 @@ function formatSigned(value) {
   return `${value}`
 }
 
+function getBaseIdFromRecordId(recordId) {
+  const parts = recordId.split('-')
+  return parts[parts.length - 1] ?? recordId
+}
+
+function buildForecastCode(type, baseId) {
+  const offset = Number(baseId.replace(/\D/g, '')) || 0
+  const prefix = type === 'dish' ? 739297000 : 839297000
+  return String(prefix + offset * 2)
+}
+
+function buildMnemonic(name) {
+  return name.replace(/\s+/g, '').slice(0, 4)
+}
+
+function getForecastCategory(type, baseId) {
+  if (type === 'dish') {
+    return DISH_CATEGORY_MAP[baseId] ?? 'hot'
+  }
+  return ITEM_CATEGORY_MAP[baseId] ?? 'base'
+}
+
 function App() {
   const [activePage, setActivePage] = useState('execution')
   const [selectedDate, setSelectedDate] = useState(DATE_OPTIONS[0].value)
@@ -173,10 +249,12 @@ function App() {
   const [keyword, setKeyword] = useState('')
   const [visibleCount, setVisibleCount] = useState(LIST_PAGE_SIZE)
   const loadMoreRef = useRef(null)
+  const forecastDraftRef = useRef(null)
 
   const [records, setRecords] = useState(() => createInitialRecords())
   const [revenueMap, setRevenueMap] = useState(() => createInitialRevenueMap())
-  const [revenueDraft, setRevenueDraft] = useState('')
+  const [lunchDraft, setLunchDraft] = useState('')
+  const [dinnerDraft, setDinnerDraft] = useState('')
 
   const [modalState, setModalState] = useState({
     open: false,
@@ -190,16 +268,31 @@ function App() {
   const [outboundWarehouse, setOutboundWarehouse] = useState(WAREHOUSE_OPTIONS[0].value)
   const [outboundDate, setOutboundDate] = useState(TODAY_VALUE)
   const [lossRemark, setLossRemark] = useState('')
+  const [forecastMethod, setForecastMethod] = useState('smart')
+  const [revenueFactor, setRevenueFactor] = useState('1.00')
+  const [forecastNameKeyword, setForecastNameKeyword] = useState('')
+  const [forecastCodeKeyword, setForecastCodeKeyword] = useState('')
+  const [forecastMnemonicKeyword, setForecastMnemonicKeyword] = useState('')
+  const [quantityFactorMap, setQuantityFactorMap] = useState({})
+  const [forecastEditing, setForecastEditing] = useState(false)
+  const [forecastFilterOpen, setForecastFilterOpen] = useState(false)
+  const [forecastCategory, setForecastCategory] = useState('all')
+  const [forecastPage, setForecastPage] = useState(1)
+  const [infoModalState, setInfoModalState] = useState({
+    open: false,
+    title: '',
+    content: '',
+  })
   const [toast, setToast] = useState('')
 
-  const currentKey = composeKey(selectedDate, selectedSlot)
-  const currentRevenue = revenueMap[currentKey]
-  const selectedSlotLabel =
-    TIME_SLOT_OPTIONS.find((option) => option.id === selectedSlot)?.label ?? '当前时段'
+  const lunchKey = composeKey(selectedDate, 'lunch')
+  const dinnerKey = composeKey(selectedDate, 'dinner')
 
   useEffect(() => {
-    setRevenueDraft(String(currentRevenue?.adjusted ?? 0))
-  }, [currentKey, currentRevenue?.adjusted])
+    setLunchDraft(String(revenueMap[lunchKey]?.adjusted ?? 0))
+    setDinnerDraft(String(revenueMap[dinnerKey]?.adjusted ?? 0))
+    setRevenueFactor('1.00')
+  }, [selectedDate, lunchKey, dinnerKey, revenueMap])
 
   useEffect(() => {
     if (!toast) return undefined
@@ -210,6 +303,26 @@ function App() {
   useEffect(() => {
     setVisibleCount(LIST_PAGE_SIZE)
   }, [selectedDate, selectedSlot, dimension, keyword])
+
+  useEffect(() => {
+    setQuantityFactorMap({})
+    setForecastNameKeyword('')
+    setForecastCodeKeyword('')
+    setForecastMnemonicKeyword('')
+    setForecastEditing(false)
+    setForecastFilterOpen(false)
+    setForecastCategory('all')
+    setForecastPage(1)
+    forecastDraftRef.current = null
+  }, [selectedDate, dimension])
+
+  useEffect(() => {
+    if (activePage !== 'revenue') return
+    setForecastEditing(false)
+    setForecastFilterOpen(false)
+    setForecastPage(1)
+    forecastDraftRef.current = null
+  }, [activePage])
 
   const executionRows = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase()
@@ -244,6 +357,80 @@ function App() {
   const visibleExecutionRows = useMemo(() => executionRows.slice(0, visibleCount), [executionRows, visibleCount])
   const hasMoreRows = visibleExecutionRows.length < executionRows.length
 
+  const forecastRows = useMemo(() => {
+    const groupedRows = new Map()
+    const normalizedName = forecastNameKeyword.trim().toLowerCase()
+    const normalizedCode = forecastCodeKeyword.trim()
+    const normalizedMnemonic = forecastMnemonicKeyword.trim().toLowerCase()
+
+    records
+      .filter((item) => item.date === selectedDate)
+      .filter((item) => item.type === dimension)
+      .forEach((item) => {
+        const baseId = getBaseIdFromRecordId(item.id)
+        const row = groupedRows.get(baseId) ?? {
+          baseId,
+          name: item.name,
+          unit: item.unit,
+          spec: '标准',
+          code: buildForecastCode(item.type, baseId),
+          mnemonic: buildMnemonic(item.name),
+          categoryId: getForecastCategory(item.type, baseId),
+          lunchQty: 0,
+          dinnerQty: 0,
+        }
+
+        if (item.slot === 'lunch') {
+          row.lunchQty = item.targetQty
+        } else if (item.slot === 'dinner') {
+          row.dinnerQty = item.targetQty
+        }
+
+        groupedRows.set(baseId, row)
+      })
+
+    return Array.from(groupedRows.values())
+      .map((row) => {
+        const factorText = quantityFactorMap[row.baseId] ?? '1.00'
+        const parsedFactor = Number(factorText)
+        const factor = Number.isFinite(parsedFactor) && parsedFactor > 0 ? parsedFactor : 1
+        const systemQty = row.lunchQty + row.dinnerQty
+
+        return {
+          ...row,
+          factorText,
+          systemQty,
+          estimatedQty: roundNumber(systemQty * factor),
+        }
+      })
+      .filter((row) => !normalizedName || row.name.toLowerCase().includes(normalizedName))
+      .filter((row) => !normalizedCode || row.code.includes(normalizedCode))
+      .filter((row) => !normalizedMnemonic || row.mnemonic.toLowerCase().includes(normalizedMnemonic))
+      .sort((a, b) => b.systemQty - a.systemQty)
+  }, [records, selectedDate, dimension, quantityFactorMap, forecastNameKeyword, forecastCodeKeyword, forecastMnemonicKeyword])
+
+  const forecastCategoryOptions = FORECAST_CATEGORY_OPTIONS[dimension]
+
+  const categoryFilteredForecastRows = useMemo(() => {
+    if (forecastCategory === 'all') return forecastRows
+    return forecastRows.filter((row) => row.categoryId === forecastCategory)
+  }, [forecastRows, forecastCategory])
+
+  const forecastTotalPages = Math.max(1, Math.ceil(categoryFilteredForecastRows.length / FORECAST_PAGE_SIZE))
+
+  const pagedForecastRows = useMemo(() => {
+    const start = (forecastPage - 1) * FORECAST_PAGE_SIZE
+    return categoryFilteredForecastRows.slice(start, start + FORECAST_PAGE_SIZE)
+  }, [categoryFilteredForecastRows, forecastPage])
+
+  useEffect(() => {
+    setForecastPage(1)
+  }, [forecastCategory, forecastNameKeyword, forecastCodeKeyword, forecastMnemonicKeyword])
+
+  useEffect(() => {
+    setForecastPage((prev) => Math.min(prev, forecastTotalPages))
+  }, [forecastTotalPages])
+
   useEffect(() => {
     const target = loadMoreRef.current
     if (!target || !hasMoreRows || typeof IntersectionObserver === 'undefined') return undefined
@@ -271,7 +458,13 @@ function App() {
     }
   }, [records, modalState.itemId])
 
-  const currentRevenueDelta = (currentRevenue?.adjusted ?? 0) - (currentRevenue?.base ?? 0)
+  const lunchRevenue = Number(lunchDraft) || 0
+  const dinnerRevenue = Number(dinnerDraft) || 0
+  const lunchBaseRevenue = revenueMap[lunchKey]?.base ?? 0
+  const dinnerBaseRevenue = revenueMap[dinnerKey]?.base ?? 0
+  const systemForecastRevenue = lunchBaseRevenue + dinnerBaseRevenue
+  const revenueFactorValue = Number.isFinite(Number(revenueFactor)) && Number(revenueFactor) > 0 ? Number(revenueFactor) : 1
+  const forecastRevenueTotal = roundNumber((lunchRevenue + dinnerRevenue) * revenueFactorValue)
 
   function handleBack() {
     if (activePage === 'revenue') {
@@ -297,41 +490,142 @@ function App() {
     })
   }
 
-  function handleQuickAdjust(percent) {
-    const currentValue = Number(revenueDraft || currentRevenue?.adjusted || 0)
-    const nextValue = Math.max(0, Math.round(currentValue * (1 + percent / 100)))
-    setRevenueDraft(String(nextValue))
+  function openInfoModal(stepKey) {
+    setInfoModalState({
+      open: true,
+      title: '说明',
+      content: FORECAST_STEP_TIPS[stepKey],
+    })
   }
 
-  function handleRevenueCommit(mode) {
-    const nextRevenue = Number(revenueDraft)
-    if (!Number.isFinite(nextRevenue) || nextRevenue <= 0) {
-      setToast('请输入大于 0 的营业额')
+  function closeInfoModal() {
+    setInfoModalState({ open: false, title: '', content: '' })
+  }
+
+  function handleGenerateForecastRevenue() {
+    if (!forecastEditing) return
+
+    const generatedFactor = forecastMethod === 'smart' ? 1.05 : 1
+    setRevenueFactor(generatedFactor.toFixed(2))
+
+    setLunchDraft(String(roundNumber(lunchBaseRevenue * generatedFactor)))
+    setDinnerDraft(String(roundNumber(dinnerBaseRevenue * generatedFactor)))
+    setToast('已生成预估营业额')
+  }
+
+  function handleGenerateForecastQty() {
+    if (!forecastEditing) return
+
+    if (categoryFilteredForecastRows.length === 0) {
+      setToast('暂无可生成的预估销量/用量')
       return
     }
 
-    const prevAdjusted = currentRevenue?.adjusted ?? nextRevenue
-    const ratio = prevAdjusted === 0 ? 1 : nextRevenue / prevAdjusted
+    const baseFactor = forecastMethod === 'smart' ? revenueFactorValue : 1
+    const nextFactorText = baseFactor.toFixed(2)
+
+    setQuantityFactorMap(() => {
+      const nextMap = {}
+      categoryFilteredForecastRows.forEach((row) => {
+        nextMap[row.baseId] = nextFactorText
+      })
+      return nextMap
+    })
+
+    setToast('已生成预估销量/用量')
+  }
+
+  function handleResetForecastFilters() {
+    setForecastNameKeyword('')
+    setForecastCodeKeyword('')
+    setForecastMnemonicKeyword('')
+  }
+
+  function startForecastEditing() {
+    forecastDraftRef.current = {
+      lunchDraft,
+      dinnerDraft,
+      revenueFactor,
+      forecastMethod,
+      quantityFactorMap: { ...quantityFactorMap },
+    }
+    setForecastEditing(true)
+  }
+
+  function cancelForecastEditing() {
+    const draft = forecastDraftRef.current
+    if (draft) {
+      setLunchDraft(draft.lunchDraft)
+      setDinnerDraft(draft.dinnerDraft)
+      setRevenueFactor(draft.revenueFactor)
+      setForecastMethod(draft.forecastMethod)
+      setQuantityFactorMap(draft.quantityFactorMap)
+    }
+    forecastDraftRef.current = null
+    setForecastEditing(false)
+    setToast('已取消本次修改')
+  }
+
+  function handleRevenueCommit(mode) {
+    if (!forecastEditing) {
+      setToast('请先点击右上角编辑')
+      return false
+    }
+
+    const nextLunchRevenue = Number(lunchDraft)
+    const nextDinnerRevenue = Number(dinnerDraft)
+    if (!Number.isFinite(nextLunchRevenue) || !Number.isFinite(nextDinnerRevenue) || nextLunchRevenue <= 0 || nextDinnerRevenue <= 0) {
+      setToast('请输入大于 0 的分时段营业额')
+      return false
+    }
+
+    const prevLunch = revenueMap[lunchKey]?.adjusted ?? nextLunchRevenue
+    const prevDinner = revenueMap[dinnerKey]?.adjusted ?? nextDinnerRevenue
+    const lunchRatio = prevLunch === 0 ? 1 : nextLunchRevenue / prevLunch
+    const dinnerRatio = prevDinner === 0 ? 1 : nextDinnerRevenue / prevDinner
 
     setRevenueMap((prev) => ({
       ...prev,
-      [currentKey]: {
-        ...prev[currentKey],
-        adjusted: nextRevenue,
+      [lunchKey]: {
+        ...prev[lunchKey],
+        adjusted: nextLunchRevenue,
+      },
+      [dinnerKey]: {
+        ...prev[dinnerKey],
+        adjusted: nextDinnerRevenue,
       },
     }))
 
     setRecords((prev) =>
       prev.map((item) => {
-        if (item.date !== selectedDate || item.slot !== selectedSlot) return item
+        if (item.date !== selectedDate) return item
+
+        let nextTargetQty = item.targetQty
+        if (item.slot === 'lunch') {
+          nextTargetQty = roundNumber(item.targetQty * lunchRatio)
+        } else if (item.slot === 'dinner') {
+          nextTargetQty = roundNumber(item.targetQty * dinnerRatio)
+        }
+
+        const baseId = getBaseIdFromRecordId(item.id)
+        const rowFactor = Number(quantityFactorMap[baseId])
+        if (item.type === dimension && Number.isFinite(rowFactor) && rowFactor > 0 && rowFactor !== 1) {
+          nextTargetQty = roundNumber(nextTargetQty * rowFactor)
+        }
+
+        if (nextTargetQty === item.targetQty) return item
+
         return {
           ...item,
-          targetQty: roundNumber(item.targetQty * ratio),
+          targetQty: nextTargetQty,
         }
       }),
     )
 
-    setToast(mode === 'publish' ? '已保存并下发到备餐执行页' : '已保存当前时段营业额调整')
+    forecastDraftRef.current = null
+    setForecastEditing(false)
+    setToast(mode === 'publish' ? '已保存并下发到备餐执行页' : '已保存当前时段备餐预估')
+    return true
   }
 
   function openModal(itemId) {
@@ -422,107 +716,279 @@ function App() {
             <ArrowLeft size={18} />
           </button>
 
-          <h1 className="header-title">{activePage === 'execution' ? '备餐' : '营业额预估调整'}</h1>
+          <h1 className="header-title">{activePage === 'execution' ? '备餐' : '备餐预估'}</h1>
 
           {activePage === 'execution' ? (
             <button type="button" className="header-right-btn" onClick={() => setActivePage('revenue')}>
-              营业额预估调整
+              备餐预估
             </button>
+          ) : forecastEditing ? (
+            <div className="header-right-actions">
+              <button type="button" className="header-right-btn secondary" onClick={cancelForecastEditing}>
+                取消
+              </button>
+              <button type="button" className="header-right-btn" onClick={() => handleRevenueCommit('save')}>
+                保存
+              </button>
+            </div>
           ) : (
-            <span className="header-right-placeholder" />
+            <button type="button" className="header-right-btn" onClick={startForecastEditing}>
+              编辑
+            </button>
           )}
         </header>
 
-        <section className="toolbar-card filter-bar">
-          <div className="dropdown-item">
-            <span className="dropdown-label">营业日</span>
-            <div className="select-wrap">
-              <select value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)}>
-                {DATE_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown size={14} />
-            </div>
-          </div>
-
-          <div className="dropdown-item">
-            <span className="dropdown-label">营业时段</span>
-            <div className="select-wrap">
-              <select value={selectedSlot} onChange={(event) => setSelectedSlot(event.target.value)}>
-                {TIME_SLOT_OPTIONS.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown size={14} />
-            </div>
-          </div>
-        </section>
-
         {activePage === 'revenue' ? (
-          <section className="panel-card">
-            <div className="panel-title">
-              <TrendingUp size={18} />
-              <h2>分时段营业额预估调整</h2>
-            </div>
-
-            <div className="revenue-stats">
-              <div className="stat-block">
-                <span>基础预估</span>
-                <strong>{currentRevenue?.base ?? 0}</strong>
-              </div>
-              <div className="stat-block">
-                <span>当前调整后</span>
-                <strong>{currentRevenue?.adjusted ?? 0}</strong>
-              </div>
-              <div className="stat-block">
-                <span>调整差值</span>
-                <strong className={currentRevenueDelta >= 0 ? 'up' : 'down'}>{formatSigned(currentRevenueDelta)}</strong>
-              </div>
-            </div>
-
-            <label className="input-label" htmlFor="revenue-input">
-              当前时段营业额（元）
-            </label>
-            <input
-              id="revenue-input"
-              className="number-input"
-              type="number"
-              min="0"
-              value={revenueDraft}
-              onChange={(event) => setRevenueDraft(event.target.value)}
-            />
-
-            <div className="quick-actions">
-              <button type="button" onClick={() => handleQuickAdjust(5)}>
-                +5%
-              </button>
-              <button type="button" onClick={() => handleQuickAdjust(10)}>
-                +10%
-              </button>
-              <button type="button" onClick={() => handleQuickAdjust(-5)}>
-                -5%
-              </button>
-              <button type="button" onClick={() => handleQuickAdjust(-10)}>
-                -10%
+          <section className="panel-card forecast-panel">
+            <div className="forecast-step-row">
+              <div className="forecast-step-title">第一步：预估营业额</div>
+              <button type="button" className="info-btn" aria-label="查看第一步说明" onClick={() => openInfoModal('step1')}>
+                <Info size={14} />
               </button>
             </div>
 
-            <p className="hint-text">
-              保存并下发后，将按比例重算 {selectedSlotLabel} 的菜品/物品预估量，并同步到备餐执行页。
-            </p>
+            <div className="forecast-method-row">
+              <span className="dropdown-label">预估方式</span>
+              <div className="forecast-method-buttons">
+                <button
+                  type="button"
+                  className={forecastMethod === 'smart' ? 'segment active' : 'segment'}
+                  onClick={() => setForecastMethod('smart')}
+                >
+                  智能算法预估
+                </button>
+                <button
+                  type="button"
+                  className={forecastMethod === 'avg' ? 'segment active' : 'segment'}
+                  onClick={() => setForecastMethod('avg')}
+                >
+                  对等日均值预估
+                </button>
+              </div>
+            </div>
 
-            <div className="footer-actions">
-              <button type="button" className="btn-subtle" onClick={() => handleRevenueCommit('save')}>
-                仅保存
+            <div className="forecast-generate-row">
+              <div className="dropdown-item">
+                <span className="dropdown-label">目标预估日期</span>
+                <div className="select-wrap">
+                  <select value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)}>
+                    {DATE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown size={14} />
+                </div>
+              </div>
+              <button type="button" className="btn-primary generate-btn" onClick={handleGenerateForecastRevenue}>
+                生成预估营业额
               </button>
-              <button type="button" className="btn-primary" onClick={() => handleRevenueCommit('publish')}>
-                保存并下发
+            </div>
+
+            <div className="forecast-table-wrap">
+              <table className="forecast-table">
+                <thead>
+                  <tr>
+                    <th>日期</th>
+                    <th>1200-1600</th>
+                    <th>1600-2000</th>
+                    <th>系统预估营业额</th>
+                    <th>系数</th>
+                    <th>预估营业额</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>{selectedDate.replace(/-/g, '/')}</td>
+                    <td>
+                      <input
+                        className="table-input"
+                        type="number"
+                        min="0"
+                        readOnly={!forecastEditing}
+                        value={lunchDraft}
+                        onChange={(event) => setLunchDraft(event.target.value)}
+                      />
+                    </td>
+                    <td>
+                      <input
+                        className="table-input"
+                        type="number"
+                        min="0"
+                        readOnly={!forecastEditing}
+                        value={dinnerDraft}
+                        onChange={(event) => setDinnerDraft(event.target.value)}
+                      />
+                    </td>
+                    <td>{systemForecastRevenue}</td>
+                    <td>
+                      <input
+                        className="table-input"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        readOnly={!forecastEditing}
+                        value={revenueFactor}
+                        onChange={(event) => setRevenueFactor(event.target.value)}
+                      />
+                    </td>
+                    <td>{forecastRevenueTotal}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div className="forecast-step-row">
+              <div className="forecast-step-title">第二步：预估销量/用量</div>
+              <button type="button" className="info-btn" aria-label="查看第二步说明" onClick={() => openInfoModal('step2')}>
+                <Info size={14} />
               </button>
+            </div>
+
+            <div className="forecast-category-tabs" role="tablist" aria-label="分类筛选">
+              {forecastCategoryOptions.map((category) => (
+                <button
+                  key={category.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={forecastCategory === category.id}
+                  className={forecastCategory === category.id ? 'forecast-category-btn active' : 'forecast-category-btn'}
+                  onClick={() => setForecastCategory(category.id)}
+                >
+                  {category.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="forecast-actions-row">
+              <button type="button" className="btn-primary generate-btn" onClick={handleGenerateForecastQty}>
+                生成预估销量/用量
+              </button>
+              <button type="button" className="btn-subtle compact" onClick={() => setForecastFilterOpen((prev) => !prev)}>
+                {forecastFilterOpen ? '收起筛选' : '筛选'}
+              </button>
+            </div>
+
+            {forecastFilterOpen && (
+              <>
+                <div className="forecast-filter-grid compact forecast-filter-panel">
+                  <label className="forecast-filter-item compact">
+                    <span>菜品名称</span>
+                    <input
+                      className="number-input compact"
+                      placeholder="请输入菜品名称"
+                      value={forecastNameKeyword}
+                      onChange={(event) => setForecastNameKeyword(event.target.value)}
+                    />
+                  </label>
+                  <label className="forecast-filter-item compact">
+                    <span>菜品编码</span>
+                    <input
+                      className="number-input compact"
+                      placeholder="请输入菜品编码"
+                      value={forecastCodeKeyword}
+                      onChange={(event) => setForecastCodeKeyword(event.target.value)}
+                    />
+                  </label>
+                  <label className="forecast-filter-item compact">
+                    <span>菜品助记码</span>
+                    <input
+                      className="number-input compact"
+                      placeholder="请输入菜品助记码"
+                      value={forecastMnemonicKeyword}
+                      onChange={(event) => setForecastMnemonicKeyword(event.target.value)}
+                    />
+                  </label>
+                </div>
+                <div className="forecast-filter-actions">
+                  <button type="button" className="btn-subtle compact" onClick={handleResetForecastFilters}>
+                    重置筛选
+                  </button>
+                </div>
+              </>
+            )}
+
+            <div className="forecast-table-wrap">
+              <table className="forecast-table">
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>编码</th>
+                    <th>规格</th>
+                    <th>单位</th>
+                    <th>1200-1600</th>
+                    <th>1600-2000</th>
+                    <th>系统预估数量</th>
+                    <th>系数</th>
+                    <th>预估数量</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {categoryFilteredForecastRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="forecast-empty">
+                        当前筛选条件下暂无预估数据
+                      </td>
+                    </tr>
+                  ) : (
+                    pagedForecastRows.map((row) => (
+                      <tr key={row.baseId}>
+                        <td>{row.name}</td>
+                        <td>{row.code}</td>
+                        <td>{row.spec}</td>
+                        <td>{row.unit}</td>
+                        <td>{row.lunchQty}</td>
+                        <td>{row.dinnerQty}</td>
+                        <td>{row.systemQty}</td>
+                        <td>
+                          <input
+                            className="table-input"
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            readOnly={!forecastEditing}
+                            value={row.factorText}
+                            onChange={(event) => {
+                              if (!forecastEditing) return
+                              const nextValue = event.target.value
+                              setQuantityFactorMap((prev) => ({
+                                ...prev,
+                                [row.baseId]: nextValue,
+                              }))
+                            }}
+                          />
+                        </td>
+                        <td>{row.estimatedQty}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="forecast-pagination">
+              <span className="forecast-pagination-info">
+                第 {forecastPage} / {forecastTotalPages} 页，共 {categoryFilteredForecastRows.length} 条
+              </span>
+              <div className="forecast-pagination-actions">
+                <button
+                  type="button"
+                  className="btn-subtle compact"
+                  disabled={forecastPage <= 1}
+                  onClick={() => setForecastPage((prev) => Math.max(1, prev - 1))}
+                >
+                  上一页
+                </button>
+                <button
+                  type="button"
+                  className="btn-subtle compact"
+                  disabled={forecastPage >= forecastTotalPages}
+                  onClick={() => setForecastPage((prev) => Math.min(forecastTotalPages, prev + 1))}
+                >
+                  下一页
+                </button>
+              </div>
             </div>
           </section>
         ) : (
@@ -787,6 +1253,25 @@ function App() {
                 确认提交
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {infoModalState.open && (
+        <div className="modal-mask info-modal-mask" onClick={closeInfoModal}>
+          <div className="modal-card info-modal-card" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3>{infoModalState.title}</h3>
+              <button type="button" onClick={closeInfoModal} className="icon-btn" aria-label="关闭说明弹窗">
+                <X size={16} />
+              </button>
+            </div>
+
+            <p className="info-modal-content">{infoModalState.content}</p>
+
+            <button type="button" className="btn-primary" onClick={closeInfoModal}>
+              我知道了
+            </button>
           </div>
         </div>
       )}
