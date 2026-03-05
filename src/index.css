@@ -195,8 +195,13 @@ textarea {
 .forecast-step-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
+}
+
+.forecast-step-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .info-btn {
@@ -237,16 +242,49 @@ textarea {
   padding: 8px 10px;
 }
 
-.forecast-method-row {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.forecast-method-buttons {
+.forecast-control-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+
+.forecast-control-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.forecast-dimension-item {
+  justify-content: flex-end;
+}
+
+.forecast-dimension-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  width: 100%;
+  border: 1px solid #f2e6b6;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #fffdf4;
+}
+
+.forecast-dimension-btn {
+  height: 32px;
+  border: none;
+  border-right: 1px solid #f2e6b6;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.forecast-dimension-btn:last-child {
+  border-right: none;
+}
+
+.forecast-dimension-btn.active {
+  background: #ffe88f;
+  color: #3c2f00;
 }
 
 .forecast-generate-row {
@@ -260,6 +298,10 @@ textarea {
   flex: 1;
   padding: 0 10px;
   white-space: nowrap;
+}
+
+.forecast-actions-row .btn-subtle.compact {
+  flex-shrink: 0;
 }
 
 .forecast-actions-row {
@@ -508,6 +550,10 @@ textarea {
   line-height: 1.35;
 }
 
+.hint-text.danger {
+  color: var(--danger);
+}
+
 .footer-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -596,6 +642,17 @@ textarea {
 
 .search-card {
   padding: 8px 10px;
+}
+
+.execution-category-card {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.execution-category-tabs {
+  padding-bottom: 0;
 }
 
 .search-wrap {
@@ -730,11 +787,6 @@ textarea {
 
 .metric-main.produced {
   background: #f7fafc;
-}
-
-.over-row {
-  font-size: 11px;
-  color: var(--warn);
 }
 
 .card-actions {
@@ -884,7 +936,7 @@ textarea {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .forecast-method-buttons,
+  .forecast-control-row,
   .forecast-filter-grid,
   .forecast-generate-row {
     grid-template-columns: 1fr;

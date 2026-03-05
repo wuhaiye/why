@@ -85,6 +85,17 @@ const ITEM_TEMPLATES = [
 
 const LIST_PAGE_SIZE = 8
 const FORECAST_PAGE_SIZE = 6
+const ACTION_AMOUNT_MAX = 9999
+const FORECAST_VALUE_MAX = 999999999
+const FACTOR_MAX = 99.99
+const FORECAST_FACTOR_STORAGE_KEY = 'kitchen-order-forecast-factor-map'
+const FORECAST_ROW_ORDER = [
+  ...DISH_TEMPLATES.map((template) => template.baseId),
+  ...ITEM_TEMPLATES.map((template) => template.baseId),
+]
+const ACTION_AMOUNT_INPUT_PATTERN = /^\d*(?:\.\d{0,2})?$/
+const ACTION_AMOUNT_SUBMIT_PATTERN = /^\d+(?:\.\d{0,2})?$/
+const QTY_FACTOR_INPUT_PATTERN = /^\d*(?:\.\d{0,2})?$/
 
 const STOCK_STATE_PRIORITY = {
   out: 0,
@@ -95,11 +106,13 @@ const STOCK_STATE_PRIORITY = {
 const FORECAST_CATEGORY_OPTIONS = {
   dish: [
     { id: 'all', label: '全部' },
-    { id: 'add-on', label: '加料' },
     { id: 'hot', label: '热菜' },
     { id: 'cold', label: '凉菜' },
     { id: 'staple', label: '主食' },
     { id: 'soup', label: '汤羹' },
+    { id: 'steam', label: '蒸菜' },
+    { id: 'pot', label: '砂锅' },
+    { id: 'snack', label: '小吃' },
   ],
   item: [
     { id: 'all', label: '全部' },
@@ -114,14 +127,14 @@ const DISH_CATEGORY_MAP = {
   d1: 'hot',
   d2: 'hot',
   d3: 'soup',
-  d4: 'add-on',
+  d4: 'steam',
   d5: 'hot',
   d6: 'hot',
   d7: 'hot',
   d8: 'staple',
-  d9: 'hot',
+  d9: 'pot',
   d10: 'hot',
-  d11: 'add-on',
+  d11: 'snack',
   d12: 'cold',
 }
 
@@ -153,6 +166,18 @@ function roundNumber(value) {
   return Math.max(0, Math.round(value))
 }
 
+function normalizeNonNegativeQty(value) {
+  if (!Number.isFinite(value)) return 0
+  const rounded = Math.round((value + Number.EPSILON) * 100) / 100
+  return Math.max(rounded, 0)
+}
+
+function formatQty(value) {
+  const normalized = normalizeNonNegativeQty(value)
+  if (Number.isInteger(normalized)) return String(normalized)
+  return normalized.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')
+}
+
 function getStockState(stockQty, warningStock) {
   if (stockQty <= 0) return 'out'
   if (stockQty <= warningStock) return 'warning'
@@ -160,8 +185,131 @@ function getStockState(stockQty, warningStock) {
 }
 
 function getPendingQty(item) {
-  const availableQty = item.producedQty - item.lossQty
-  return Math.max(item.targetQty - availableQty, 0)
+  const targetQty = normalizeNonNegativeQty(item.targetQty)
+  const availableQty = normalizeNonNegativeQty(item.producedQty) - normalizeNonNegativeQty(item.lossQty)
+  return normalizeNonNegativeQty(targetQty - availableQty)
+}
+
+function splitRevenueByRatio(totalRevenue, baseRevenues) {
+  const normalizedTotal = clampForecastRounded(totalRevenue)
+  const normalizedBases = baseRevenues.map((value) => clampForecastValue(value))
+  const baseTotal = normalizedBases.reduce((sum, value) => sum + value, 0)
+
+  if (normalizedBases.length === 0) return []
+
+  if (baseTotal <= 0) {
+    const shared = roundNumber(normalizedTotal / normalizedBases.length)
+    return normalizedBases.map((_, index) => {
+      if (index === normalizedBases.length - 1) {
+        return normalizeNonNegativeQty(normalizedTotal - shared * (normalizedBases.length - 1))
+      }
+      return shared
+    })
+  }
+
+  let allocated = 0
+  return normalizedBases.map((baseRevenue, index) => {
+    if (index === normalizedBases.length - 1) {
+      return normalizeNonNegativeQty(normalizedTotal - allocated)
+    }
+
+    const slotRevenue = roundNumber((normalizedTotal * baseRevenue) / baseTotal)
+    allocated += slotRevenue
+    return slotRevenue
+  })
+}
+
+function formatRevenueFactorByTotal(totalRevenue, systemRevenue) {
+  const normalizedSystem = normalizeNonNegativeQty(systemRevenue)
+  if (normalizedSystem <= 0) return '1.00'
+
+  const ratio = normalizeNonNegativeQty(totalRevenue) / normalizedSystem
+  const boundedRatio = Math.min(ratio, FACTOR_MAX)
+  return boundedRatio.toFixed(2)
+}
+
+function normalizePositiveFactorText(value) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return '1.00'
+  const bounded = Math.min(parsed, FACTOR_MAX)
+  return bounded.toFixed(2)
+}
+
+function clampForecastValue(value) {
+  return Math.min(normalizeNonNegativeQty(value), FORECAST_VALUE_MAX)
+}
+
+function clampForecastRounded(value) {
+  return Math.min(roundNumber(value), FORECAST_VALUE_MAX)
+}
+
+function normalizeForecastDraftText(value) {
+  const sanitized = String(value ?? '').trim()
+  if (sanitized.startsWith('-')) return null
+  if (sanitized && !ACTION_AMOUNT_INPUT_PATTERN.test(sanitized)) return null
+
+  const parsed = Number(sanitized)
+  if (sanitized && Number.isFinite(parsed) && parsed > FORECAST_VALUE_MAX) {
+    return String(FORECAST_VALUE_MAX)
+  }
+
+  return sanitized
+}
+
+function normalizeFactorDraftText(value) {
+  const sanitized = String(value ?? '').trim()
+  if (sanitized.startsWith('-')) return null
+  if (sanitized && !QTY_FACTOR_INPUT_PATTERN.test(sanitized)) return null
+
+  const parsed = Number(sanitized)
+  if (sanitized && Number.isFinite(parsed) && parsed > FACTOR_MAX) {
+    return String(FACTOR_MAX)
+  }
+
+  return sanitized
+}
+
+function buildQuantityFactorStoragePrefix(date, dimension) {
+  return `${date}::${dimension}::`
+}
+
+function buildQuantityFactorStorageKey(date, dimension, baseId) {
+  return `${buildQuantityFactorStoragePrefix(date, dimension)}${baseId}`
+}
+
+function loadSavedQuantityFactorMap() {
+  if (typeof window === 'undefined') return {}
+
+  try {
+    const raw = window.localStorage.getItem(FORECAST_FACTOR_STORAGE_KEY)
+    if (!raw) return {}
+
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+
+    const normalized = {}
+    Object.entries(parsed).forEach(([storageKey, factorText]) => {
+      normalized[storageKey] = normalizePositiveFactorText(factorText)
+    })
+
+    return normalized
+  } catch {
+    return {}
+  }
+}
+
+function pickQuantityFactorsForContext(savedMap, date, dimension) {
+  const prefix = buildQuantityFactorStoragePrefix(date, dimension)
+
+  return Object.entries(savedMap).reduce((result, [storageKey, factorText]) => {
+    if (!storageKey.startsWith(prefix)) return result
+
+    const baseId = storageKey.slice(prefix.length)
+    if (!baseId) return result
+
+    result[baseId] = normalizePositiveFactorText(factorText)
+    return result
+  }, {})
 }
 
 function createInitialRecords() {
@@ -233,6 +381,11 @@ function buildMnemonic(name) {
   return name.replace(/\s+/g, '').slice(0, 4)
 }
 
+function getForecastRowOrder(baseId) {
+  const index = FORECAST_ROW_ORDER.indexOf(baseId)
+  return index >= 0 ? index : Number.MAX_SAFE_INTEGER
+}
+
 function getForecastCategory(type, baseId) {
   if (type === 'dish') {
     return DISH_CATEGORY_MAP[baseId] ?? 'hot'
@@ -245,11 +398,14 @@ function App() {
   const [selectedDate, setSelectedDate] = useState(DATE_OPTIONS[0].value)
   const [selectedSlot, setSelectedSlot] = useState(TIME_SLOT_OPTIONS[0].id)
   const [dimension, setDimension] = useState('dish')
+  const [forecastDimension, setForecastDimension] = useState('dish')
   const [searchOpen, setSearchOpen] = useState(false)
   const [keyword, setKeyword] = useState('')
+  const [executionCategory, setExecutionCategory] = useState('all')
   const [visibleCount, setVisibleCount] = useState(LIST_PAGE_SIZE)
   const loadMoreRef = useRef(null)
   const forecastDraftRef = useRef(null)
+  const forecastQtyBaselineRef = useRef(null)
 
   const [records, setRecords] = useState(() => createInitialRecords())
   const [revenueMap, setRevenueMap] = useState(() => createInitialRevenueMap())
@@ -273,11 +429,13 @@ function App() {
   const [forecastNameKeyword, setForecastNameKeyword] = useState('')
   const [forecastCodeKeyword, setForecastCodeKeyword] = useState('')
   const [forecastMnemonicKeyword, setForecastMnemonicKeyword] = useState('')
+  const [savedQuantityFactorMap, setSavedQuantityFactorMap] = useState(() => loadSavedQuantityFactorMap())
   const [quantityFactorMap, setQuantityFactorMap] = useState({})
   const [forecastEditing, setForecastEditing] = useState(false)
   const [forecastFilterOpen, setForecastFilterOpen] = useState(false)
   const [forecastCategory, setForecastCategory] = useState('all')
   const [forecastPage, setForecastPage] = useState(1)
+  const [forecastQtyNeedsRegenerate, setForecastQtyNeedsRegenerate] = useState(false)
   const [infoModalState, setInfoModalState] = useState({
     open: false,
     title: '',
@@ -289,9 +447,20 @@ function App() {
   const dinnerKey = composeKey(selectedDate, 'dinner')
 
   useEffect(() => {
-    setLunchDraft(String(revenueMap[lunchKey]?.adjusted ?? 0))
-    setDinnerDraft(String(revenueMap[dinnerKey]?.adjusted ?? 0))
-    setRevenueFactor('1.00')
+    const nextLunchBaseRevenue = normalizeNonNegativeQty(revenueMap[lunchKey]?.base ?? 0)
+    const nextDinnerBaseRevenue = normalizeNonNegativeQty(revenueMap[dinnerKey]?.base ?? 0)
+    const systemRevenueTotal = nextLunchBaseRevenue + nextDinnerBaseRevenue
+
+    const nextLunchAdjusted = clampForecastValue(revenueMap[lunchKey]?.adjusted ?? 0)
+    const nextDinnerAdjusted = clampForecastValue(revenueMap[dinnerKey]?.adjusted ?? 0)
+    const nextForecastRevenueTotal = clampForecastRounded(nextLunchAdjusted + nextDinnerAdjusted)
+
+    const [nextLunchDraft, nextDinnerDraft] = splitRevenueByRatio(nextForecastRevenueTotal, [nextLunchBaseRevenue, nextDinnerBaseRevenue])
+    const nextFactor = formatRevenueFactorByTotal(nextForecastRevenueTotal, systemRevenueTotal)
+
+    setLunchDraft(String(nextLunchDraft))
+    setDinnerDraft(String(nextDinnerDraft))
+    setRevenueFactor(nextFactor)
   }, [selectedDate, lunchKey, dinnerKey, revenueMap])
 
   useEffect(() => {
@@ -301,28 +470,67 @@ function App() {
   }, [toast])
 
   useEffect(() => {
-    setVisibleCount(LIST_PAGE_SIZE)
-  }, [selectedDate, selectedSlot, dimension, keyword])
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(FORECAST_FACTOR_STORAGE_KEY, JSON.stringify(savedQuantityFactorMap))
+  }, [savedQuantityFactorMap])
 
   useEffect(() => {
-    setQuantityFactorMap({})
+    setVisibleCount(LIST_PAGE_SIZE)
+  }, [selectedDate, selectedSlot, dimension, keyword, executionCategory])
+
+  useEffect(() => {
+    const contextQuantityFactorMap = pickQuantityFactorsForContext(savedQuantityFactorMap, selectedDate, forecastDimension)
+    setQuantityFactorMap(contextQuantityFactorMap)
     setForecastNameKeyword('')
     setForecastCodeKeyword('')
     setForecastMnemonicKeyword('')
-    setForecastEditing(false)
     setForecastFilterOpen(false)
     setForecastCategory('all')
     setForecastPage(1)
+    setForecastQtyNeedsRegenerate(false)
+
+    const nextLunchBaseRevenue = normalizeNonNegativeQty(revenueMap[lunchKey]?.base ?? 0)
+    const nextDinnerBaseRevenue = normalizeNonNegativeQty(revenueMap[dinnerKey]?.base ?? 0)
+    const systemRevenueTotal = nextLunchBaseRevenue + nextDinnerBaseRevenue
+
+    const nextLunchAdjusted = clampForecastValue(revenueMap[lunchKey]?.adjusted ?? 0)
+    const nextDinnerAdjusted = clampForecastValue(revenueMap[dinnerKey]?.adjusted ?? 0)
+    const nextForecastRevenueTotal = clampForecastRounded(nextLunchAdjusted + nextDinnerAdjusted)
+    const [nextLunchRevenue, nextDinnerRevenue] = splitRevenueByRatio(nextForecastRevenueTotal, [nextLunchBaseRevenue, nextDinnerBaseRevenue])
+
+    const nextLunchDraft = String(nextLunchRevenue)
+    const nextDinnerDraft = String(nextDinnerRevenue)
+    const nextRevenueFactor = formatRevenueFactorByTotal(nextForecastRevenueTotal, systemRevenueTotal)
+
+    if (forecastEditing) {
+      forecastDraftRef.current = {
+        lunchDraft: nextLunchDraft,
+        dinnerDraft: nextDinnerDraft,
+        revenueFactor: nextRevenueFactor,
+        forecastMethod,
+        quantityFactorMap: { ...contextQuantityFactorMap },
+      }
+      syncForecastQtyBaseline(nextLunchDraft, nextDinnerDraft, nextRevenueFactor)
+      return
+    }
+
     forecastDraftRef.current = null
-  }, [selectedDate, dimension])
+    forecastQtyBaselineRef.current = null
+  }, [selectedDate, forecastDimension, savedQuantityFactorMap])
 
   useEffect(() => {
     if (activePage !== 'revenue') return
     setForecastEditing(false)
     setForecastFilterOpen(false)
     setForecastPage(1)
+    setForecastQtyNeedsRegenerate(false)
     forecastDraftRef.current = null
+    forecastQtyBaselineRef.current = null
   }, [activePage])
+
+  useEffect(() => {
+    setExecutionCategory('all')
+  }, [dimension])
 
   const executionRows = useMemo(() => {
     const normalizedKeyword = keyword.trim().toLowerCase()
@@ -330,16 +538,25 @@ function App() {
     return records
       .filter((item) => item.date === selectedDate && item.slot === selectedSlot)
       .filter((item) => item.type === dimension)
+      .filter((item) => {
+        if (executionCategory === 'all') return true
+        const baseId = getBaseIdFromRecordId(item.id)
+        return getForecastCategory(item.type, baseId) === executionCategory
+      })
       .filter((item) => !normalizedKeyword || item.name.toLowerCase().includes(normalizedKeyword))
       .map((item) => {
+        const normalizedProducedQty = normalizeNonNegativeQty(item.producedQty)
+        const normalizedLossQty = normalizeNonNegativeQty(item.lossQty)
+        const normalizedStockQty = normalizeNonNegativeQty(item.stockQty)
         const pendingQty = getPendingQty(item)
-        const overQty = Math.max(item.producedQty - item.lossQty - item.targetQty, 0)
-        const stockState = getStockState(item.stockQty, item.warningStock)
+        const stockState = getStockState(normalizedStockQty, item.warningStock)
 
         return {
           ...item,
+          producedQty: normalizedProducedQty,
+          lossQty: normalizedLossQty,
+          stockQty: normalizedStockQty,
           pendingQty,
-          overQty,
           stockState,
         }
       })
@@ -352,7 +569,7 @@ function App() {
 
         return a.name.localeCompare(b.name, 'zh-Hans-CN')
       })
-  }, [records, selectedDate, selectedSlot, dimension, keyword])
+  }, [records, selectedDate, selectedSlot, dimension, keyword, executionCategory])
 
   const visibleExecutionRows = useMemo(() => executionRows.slice(0, visibleCount), [executionRows, visibleCount])
   const hasMoreRows = visibleExecutionRows.length < executionRows.length
@@ -365,7 +582,7 @@ function App() {
 
     records
       .filter((item) => item.date === selectedDate)
-      .filter((item) => item.type === dimension)
+      .filter((item) => item.type === forecastDimension)
       .forEach((item) => {
         const baseId = getBaseIdFromRecordId(item.id)
         const row = groupedRows.get(baseId) ?? {
@@ -391,25 +608,38 @@ function App() {
 
     return Array.from(groupedRows.values())
       .map((row) => {
-        const factorText = quantityFactorMap[row.baseId] ?? '1.00'
-        const parsedFactor = Number(factorText)
-        const factor = Number.isFinite(parsedFactor) && parsedFactor > 0 ? parsedFactor : 1
-        const systemQty = row.lunchQty + row.dinnerQty
+        const draftFactorText = quantityFactorMap[row.baseId]
+        const factorText = draftFactorText ?? '1.00'
+        const factor = Number(normalizePositiveFactorText(factorText))
+        const originalLunchQty = clampForecastValue(row.lunchQty)
+        const originalDinnerQty = clampForecastValue(row.dinnerQty)
+        const systemQty = clampForecastRounded(originalLunchQty + originalDinnerQty)
+        const estimatedQty = clampForecastRounded(systemQty * factor)
+        const [estimatedLunchQty, estimatedDinnerQty] = splitRevenueByRatio(estimatedQty, [originalLunchQty, originalDinnerQty])
 
         return {
           ...row,
           factorText,
+          lunchQty: estimatedLunchQty,
+          dinnerQty: estimatedDinnerQty,
           systemQty,
-          estimatedQty: roundNumber(systemQty * factor),
+          estimatedQty,
         }
       })
       .filter((row) => !normalizedName || row.name.toLowerCase().includes(normalizedName))
       .filter((row) => !normalizedCode || row.code.includes(normalizedCode))
       .filter((row) => !normalizedMnemonic || row.mnemonic.toLowerCase().includes(normalizedMnemonic))
-      .sort((a, b) => b.systemQty - a.systemQty)
-  }, [records, selectedDate, dimension, quantityFactorMap, forecastNameKeyword, forecastCodeKeyword, forecastMnemonicKeyword])
+      .sort((a, b) => {
+        const orderDiff = getForecastRowOrder(a.baseId) - getForecastRowOrder(b.baseId)
+        if (orderDiff !== 0) return orderDiff
 
-  const forecastCategoryOptions = FORECAST_CATEGORY_OPTIONS[dimension]
+        return a.code.localeCompare(b.code)
+      })
+  }, [records, selectedDate, forecastDimension, quantityFactorMap, forecastNameKeyword, forecastCodeKeyword, forecastMnemonicKeyword])
+
+  const executionCategoryOptions = FORECAST_CATEGORY_OPTIONS[dimension]
+  const forecastCategoryLabel = forecastDimension === 'dish' ? '菜品' : '物品'
+  const forecastCategoryOptions = FORECAST_CATEGORY_OPTIONS[forecastDimension]
 
   const categoryFilteredForecastRows = useMemo(() => {
     if (forecastCategory === 'all') return forecastRows
@@ -454,17 +684,140 @@ function App() {
 
     return {
       ...raw,
+      producedQty: normalizeNonNegativeQty(raw.producedQty),
+      lossQty: normalizeNonNegativeQty(raw.lossQty),
+      stockQty: normalizeNonNegativeQty(raw.stockQty),
       pendingQty: getPendingQty(raw),
     }
   }, [records, modalState.itemId])
 
-  const lunchRevenue = Number(lunchDraft) || 0
-  const dinnerRevenue = Number(dinnerDraft) || 0
-  const lunchBaseRevenue = revenueMap[lunchKey]?.base ?? 0
-  const dinnerBaseRevenue = revenueMap[dinnerKey]?.base ?? 0
-  const systemForecastRevenue = lunchBaseRevenue + dinnerBaseRevenue
-  const revenueFactorValue = Number.isFinite(Number(revenueFactor)) && Number(revenueFactor) > 0 ? Number(revenueFactor) : 1
-  const forecastRevenueTotal = roundNumber((lunchRevenue + dinnerRevenue) * revenueFactorValue)
+  const lunchRevenue = clampForecastValue(Number(lunchDraft) || 0)
+  const dinnerRevenue = clampForecastValue(Number(dinnerDraft) || 0)
+  const lunchBaseRevenue = normalizeNonNegativeQty(revenueMap[lunchKey]?.base ?? 0)
+  const dinnerBaseRevenue = normalizeNonNegativeQty(revenueMap[dinnerKey]?.base ?? 0)
+  const systemForecastRevenue = roundNumber(lunchBaseRevenue + dinnerBaseRevenue)
+  const revenueFactorValue = Number(normalizePositiveFactorText(revenueFactor))
+  const forecastRevenueTotal = clampForecastRounded(lunchRevenue + dinnerRevenue)
+
+  function isSameNumberLikeValue(left, right) {
+    const leftNumber = Number(left)
+    const rightNumber = Number(right)
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+      return leftNumber === rightNumber
+    }
+    return String(left ?? '').trim() === String(right ?? '').trim()
+  }
+
+  function syncForecastQtyBaseline(nextLunch = lunchDraft, nextDinner = dinnerDraft, nextFactor = revenueFactor) {
+    forecastQtyBaselineRef.current = {
+      lunchDraft: String(nextLunch ?? '').trim(),
+      dinnerDraft: String(nextDinner ?? '').trim(),
+      revenueFactor: String(nextFactor ?? '').trim(),
+    }
+    setForecastQtyNeedsRegenerate(false)
+  }
+
+  function checkForecastQtyNeedsRegenerate(nextLunch = lunchDraft, nextDinner = dinnerDraft, nextFactor = revenueFactor) {
+    const baseline = forecastQtyBaselineRef.current
+    if (!baseline) return false
+
+    return (
+      !isSameNumberLikeValue(nextLunch, baseline.lunchDraft) ||
+      !isSameNumberLikeValue(nextDinner, baseline.dinnerDraft) ||
+      !isSameNumberLikeValue(nextFactor, baseline.revenueFactor)
+    )
+  }
+
+  function syncDraftRevenueByFactor(nextFactorText, shouldCheckRegenerate = true) {
+    const normalizedFactorText = normalizePositiveFactorText(nextFactorText)
+    const normalizedFactor = Number(normalizedFactorText)
+    const nextForecastRevenueTotal = clampForecastRounded(systemForecastRevenue * normalizedFactor)
+    const [nextLunchRevenue, nextDinnerRevenue] = splitRevenueByRatio(nextForecastRevenueTotal, [lunchBaseRevenue, dinnerBaseRevenue])
+
+    const nextLunchDraft = String(nextLunchRevenue)
+    const nextDinnerDraft = String(nextDinnerRevenue)
+
+    setLunchDraft(nextLunchDraft)
+    setDinnerDraft(nextDinnerDraft)
+
+    let needsRegenerate = false
+    if (shouldCheckRegenerate) {
+      needsRegenerate = checkForecastQtyNeedsRegenerate(nextLunchDraft, nextDinnerDraft, normalizedFactorText)
+      setForecastQtyNeedsRegenerate(needsRegenerate)
+    }
+
+    return {
+      nextLunchDraft,
+      nextDinnerDraft,
+      normalizedFactorText,
+      nextForecastRevenueTotal,
+      needsRegenerate,
+    }
+  }
+
+  function handleRevenueFactorChange(value) {
+    const normalizedInput = normalizeFactorDraftText(value)
+    if (normalizedInput === null) return
+
+    setRevenueFactor(normalizedInput)
+
+    if (!forecastEditing) return
+    syncDraftRevenueByFactor(normalizedInput)
+  }
+
+  function handleSlotRevenueChange(nextLunchValue, nextDinnerValue) {
+    const normalizedLunchInput = normalizeForecastDraftText(nextLunchValue)
+    const normalizedDinnerInput = normalizeForecastDraftText(nextDinnerValue)
+    if (normalizedLunchInput === null || normalizedDinnerInput === null) return
+
+    setLunchDraft(normalizedLunchInput)
+    setDinnerDraft(normalizedDinnerInput)
+
+    if (!forecastEditing) return
+
+    const nextLunchRevenue = clampForecastValue(Number(normalizedLunchInput) || 0)
+    const nextDinnerRevenue = clampForecastValue(Number(normalizedDinnerInput) || 0)
+    const nextForecastRevenueTotal = clampForecastRounded(nextLunchRevenue + nextDinnerRevenue)
+    const nextFactorText = formatRevenueFactorByTotal(nextForecastRevenueTotal, systemForecastRevenue)
+
+    setRevenueFactor(nextFactorText)
+
+    const needsRegenerate = checkForecastQtyNeedsRegenerate(normalizedLunchInput, normalizedDinnerInput, nextFactorText)
+    setForecastQtyNeedsRegenerate(needsRegenerate)
+  }
+
+  function handleSlotRevenueBlur() {
+    if (!forecastEditing) return
+
+    const normalizedLunch = clampForecastValue(Number(lunchDraft) || 0)
+    const normalizedDinner = clampForecastValue(Number(dinnerDraft) || 0)
+    const normalizedTotal = clampForecastRounded(normalizedLunch + normalizedDinner)
+    const normalizedFactorText = formatRevenueFactorByTotal(normalizedTotal, systemForecastRevenue)
+
+    const normalizedLunchText = String(normalizedLunch)
+    const normalizedDinnerText = String(normalizedDinner)
+    setLunchDraft(normalizedLunchText)
+    setDinnerDraft(normalizedDinnerText)
+    setRevenueFactor(normalizedFactorText)
+
+    const needsRegenerate = checkForecastQtyNeedsRegenerate(normalizedLunchText, normalizedDinnerText, normalizedFactorText)
+    setForecastQtyNeedsRegenerate(needsRegenerate)
+    if (needsRegenerate) {
+      setToast('营业额已变更，请重新生成预估销量/用量')
+    }
+  }
+
+  function handleRevenueFactorBlur() {
+    if (!forecastEditing) return
+
+    const normalizedFactorText = normalizePositiveFactorText(revenueFactor)
+    setRevenueFactor(normalizedFactorText)
+    const syncResult = syncDraftRevenueByFactor(normalizedFactorText)
+
+    if (syncResult?.needsRegenerate) {
+      setToast('营业额已变更，请重新生成预估销量/用量')
+    }
+  }
 
   function handleBack() {
     if (activePage === 'revenue') {
@@ -490,6 +843,22 @@ function App() {
     })
   }
 
+  function handleForecastDateChange(event) {
+    const nextDate = event.target.value
+    setSelectedDate(nextDate)
+
+    if (forecastEditing) return
+
+    setForecastNameKeyword('')
+    setForecastCodeKeyword('')
+    setForecastMnemonicKeyword('')
+    setForecastFilterOpen(false)
+    setForecastCategory('all')
+    setForecastPage(1)
+    setForecastQtyNeedsRegenerate(false)
+    forecastQtyBaselineRef.current = null
+  }
+
   function openInfoModal(stepKey) {
     setInfoModalState({
       open: true,
@@ -506,11 +875,11 @@ function App() {
     if (!forecastEditing) return
 
     const generatedFactor = forecastMethod === 'smart' ? 1.05 : 1
-    setRevenueFactor(generatedFactor.toFixed(2))
+    const nextRevenueFactor = normalizePositiveFactorText(generatedFactor)
 
-    setLunchDraft(String(roundNumber(lunchBaseRevenue * generatedFactor)))
-    setDinnerDraft(String(roundNumber(dinnerBaseRevenue * generatedFactor)))
-    setToast('已生成预估营业额')
+    setRevenueFactor(nextRevenueFactor)
+    const syncResult = syncDraftRevenueByFactor(nextRevenueFactor)
+    setToast(syncResult?.needsRegenerate ? '已生成预估营业额，请重新生成预估销量/用量' : '已生成预估营业额')
   }
 
   function handleGenerateForecastQty() {
@@ -522,7 +891,7 @@ function App() {
     }
 
     const baseFactor = forecastMethod === 'smart' ? revenueFactorValue : 1
-    const nextFactorText = baseFactor.toFixed(2)
+    const nextFactorText = normalizePositiveFactorText(baseFactor)
 
     setQuantityFactorMap(() => {
       const nextMap = {}
@@ -532,6 +901,7 @@ function App() {
       return nextMap
     })
 
+    syncForecastQtyBaseline()
     setToast('已生成预估销量/用量')
   }
 
@@ -539,6 +909,20 @@ function App() {
     setForecastNameKeyword('')
     setForecastCodeKeyword('')
     setForecastMnemonicKeyword('')
+  }
+
+  function updateAmountInput(rawValue) {
+    const sanitized = rawValue.trim()
+    if (sanitized.startsWith('-')) return
+    if (sanitized && !ACTION_AMOUNT_INPUT_PATTERN.test(sanitized)) return
+
+    const parsed = Number(sanitized)
+    if (sanitized && Number.isFinite(parsed) && parsed > ACTION_AMOUNT_MAX) {
+      setAmountInput(String(ACTION_AMOUNT_MAX))
+      return
+    }
+
+    setAmountInput(sanitized)
   }
 
   function startForecastEditing() {
@@ -549,6 +933,7 @@ function App() {
       forecastMethod,
       quantityFactorMap: { ...quantityFactorMap },
     }
+    syncForecastQtyBaseline(lunchDraft, dinnerDraft, revenueFactor)
     setForecastEditing(true)
   }
 
@@ -562,6 +947,8 @@ function App() {
       setQuantityFactorMap(draft.quantityFactorMap)
     }
     forecastDraftRef.current = null
+    forecastQtyBaselineRef.current = null
+    setForecastQtyNeedsRegenerate(false)
     setForecastEditing(false)
     setToast('已取消本次修改')
   }
@@ -572,15 +959,28 @@ function App() {
       return false
     }
 
-    const nextLunchRevenue = Number(lunchDraft)
-    const nextDinnerRevenue = Number(dinnerDraft)
+    const nextLunchRevenue = clampForecastValue(Number(lunchDraft))
+    const nextDinnerRevenue = clampForecastValue(Number(dinnerDraft))
     if (!Number.isFinite(nextLunchRevenue) || !Number.isFinite(nextDinnerRevenue) || nextLunchRevenue <= 0 || nextDinnerRevenue <= 0) {
       setToast('请输入大于 0 的分时段营业额')
       return false
     }
 
-    const prevLunch = revenueMap[lunchKey]?.adjusted ?? nextLunchRevenue
-    const prevDinner = revenueMap[dinnerKey]?.adjusted ?? nextDinnerRevenue
+    setLunchDraft(String(nextLunchRevenue))
+    setDinnerDraft(String(nextDinnerRevenue))
+
+    const nextFactorText = formatRevenueFactorByTotal(clampForecastRounded(nextLunchRevenue + nextDinnerRevenue), systemForecastRevenue)
+    setRevenueFactor(nextFactorText)
+
+    const needsRegenerate = checkForecastQtyNeedsRegenerate(String(nextLunchRevenue), String(nextDinnerRevenue), nextFactorText)
+    if (needsRegenerate) {
+      setForecastQtyNeedsRegenerate(true)
+      setToast('营业额已变更，请重新生成预估销量/用量')
+      return false
+    }
+
+    const prevLunch = clampForecastValue(revenueMap[lunchKey]?.adjusted ?? nextLunchRevenue)
+    const prevDinner = clampForecastValue(revenueMap[dinnerKey]?.adjusted ?? nextDinnerRevenue)
     const lunchRatio = prevLunch === 0 ? 1 : nextLunchRevenue / prevLunch
     const dinnerRatio = prevDinner === 0 ? 1 : nextDinnerRevenue / prevDinner
 
@@ -602,15 +1002,15 @@ function App() {
 
         let nextTargetQty = item.targetQty
         if (item.slot === 'lunch') {
-          nextTargetQty = roundNumber(item.targetQty * lunchRatio)
+          nextTargetQty = clampForecastRounded(item.targetQty * lunchRatio)
         } else if (item.slot === 'dinner') {
-          nextTargetQty = roundNumber(item.targetQty * dinnerRatio)
+          nextTargetQty = clampForecastRounded(item.targetQty * dinnerRatio)
         }
 
         const baseId = getBaseIdFromRecordId(item.id)
-        const rowFactor = Number(quantityFactorMap[baseId])
-        if (item.type === dimension && Number.isFinite(rowFactor) && rowFactor > 0 && rowFactor !== 1) {
-          nextTargetQty = roundNumber(nextTargetQty * rowFactor)
+        const rowFactor = Number(normalizePositiveFactorText(quantityFactorMap[baseId] ?? '1.00'))
+        if (item.type === forecastDimension && rowFactor !== 1) {
+          nextTargetQty = clampForecastRounded(nextTargetQty * rowFactor)
         }
 
         if (nextTargetQty === item.targetQty) return item
@@ -622,9 +1022,31 @@ function App() {
       }),
     )
 
+    setSavedQuantityFactorMap((prev) => {
+      const nextSavedMap = { ...prev }
+      const contextPrefix = buildQuantityFactorStoragePrefix(selectedDate, forecastDimension)
+
+      Object.keys(nextSavedMap).forEach((storageKey) => {
+        if (storageKey.startsWith(contextPrefix)) {
+          delete nextSavedMap[storageKey]
+        }
+      })
+
+      Object.entries(quantityFactorMap).forEach(([baseId, factorText]) => {
+        const normalizedFactorText = normalizePositiveFactorText(factorText)
+        if (normalizedFactorText === '1.00') return
+
+        nextSavedMap[buildQuantityFactorStorageKey(selectedDate, forecastDimension, baseId)] = normalizedFactorText
+      })
+
+      return nextSavedMap
+    })
+
     forecastDraftRef.current = null
+    forecastQtyBaselineRef.current = null
+    setForecastQtyNeedsRegenerate(false)
     setForecastEditing(false)
-    setToast(mode === 'publish' ? '已保存并下发到备餐执行页' : '已保存当前时段备餐预估')
+    setToast(mode === 'publish' ? '已保存并下发到备餐执行页' : '保存成功')
     return true
   }
 
@@ -633,7 +1055,7 @@ function App() {
     const pendingQty = target ? getPendingQty(target) : 0
 
     setModalState({ open: true, itemId, action: 'produce' })
-    setAmountInput(String(pendingQty))
+    setAmountInput(formatQty(pendingQty))
     setLossDate(selectedDate)
     setLossReason('')
     setInboundWarehouse(WAREHOUSE_OPTIONS[0].value)
@@ -651,7 +1073,7 @@ function App() {
     }))
 
     if (nextAction === 'produce') {
-      setAmountInput(String(selectedItem.pendingQty))
+      setAmountInput(formatQty(selectedItem.pendingQty))
       return
     }
 
@@ -668,14 +1090,38 @@ function App() {
   }
 
   function applyRecordAction() {
-    const amount = Number(amountInput)
+    const normalizedInput = amountInput.trim()
+    if (!ACTION_AMOUNT_SUBMIT_PATTERN.test(normalizedInput)) {
+      setToast('请输入最多2位小数的正数')
+      return
+    }
+
+    const amount = Number(normalizedInput)
     if (!Number.isFinite(amount) || amount <= 0) {
       setToast('请输入大于 0 的数量')
       return
     }
 
+    if (amount > ACTION_AMOUNT_MAX) {
+      setToast('数量不能超过 9999')
+      return
+    }
+
+    const normalizedAmount = normalizeNonNegativeQty(amount)
+
     if (modalState.action === 'loss' && !lossReason) {
       setToast('请选择报损原因')
+      return
+    }
+
+    if (!selectedItem) {
+      setToast('未找到待操作记录')
+      return
+    }
+
+    const currentStock = normalizeNonNegativeQty(selectedItem.stockQty)
+    if (modalState.action === 'loss' && normalizedAmount > currentStock) {
+      setToast('报损数量不能超过剩余库存')
       return
     }
 
@@ -683,18 +1129,22 @@ function App() {
       prev.map((item) => {
         if (item.id !== modalState.itemId) return item
 
+        const currentProduced = normalizeNonNegativeQty(item.producedQty)
+        const currentLoss = normalizeNonNegativeQty(item.lossQty)
+        const currentStockQty = normalizeNonNegativeQty(item.stockQty)
+
         if (modalState.action === 'produce') {
           return {
             ...item,
-            producedQty: item.producedQty + amount,
-            stockQty: item.stockQty + amount,
+            producedQty: normalizeNonNegativeQty(currentProduced + normalizedAmount),
+            stockQty: normalizeNonNegativeQty(currentStockQty + normalizedAmount),
           }
         }
 
         return {
           ...item,
-          lossQty: item.lossQty + amount,
-          stockQty: item.stockQty - amount,
+          lossQty: normalizeNonNegativeQty(currentLoss + normalizedAmount),
+          stockQty: normalizeNonNegativeQty(currentStockQty - normalizedAmount),
         }
       }),
     )
@@ -741,29 +1191,47 @@ function App() {
         {activePage === 'revenue' ? (
           <section className="panel-card forecast-panel">
             <div className="forecast-step-row">
-              <div className="forecast-step-title">第一步：预估营业额</div>
-              <button type="button" className="info-btn" aria-label="查看第一步说明" onClick={() => openInfoModal('step1')}>
-                <Info size={14} />
-              </button>
+              <div className="forecast-step-title-wrap">
+                <div className="forecast-step-title">第一步：预估营业额</div>
+                <button type="button" className="info-btn" aria-label="查看第一步说明" onClick={() => openInfoModal('step1')}>
+                  <Info size={14} />
+                </button>
+              </div>
             </div>
 
-            <div className="forecast-method-row">
-              <span className="dropdown-label">预估方式</span>
-              <div className="forecast-method-buttons">
-                <button
-                  type="button"
-                  className={forecastMethod === 'smart' ? 'segment active' : 'segment'}
-                  onClick={() => setForecastMethod('smart')}
-                >
-                  智能算法预估
-                </button>
-                <button
-                  type="button"
-                  className={forecastMethod === 'avg' ? 'segment active' : 'segment'}
-                  onClick={() => setForecastMethod('avg')}
-                >
-                  对等日均值预估
-                </button>
+            <div className="forecast-control-row">
+              <div className="forecast-control-item">
+                <span className="dropdown-label">预估方式</span>
+                <div className="select-wrap">
+                  <select value={forecastMethod} onChange={(event) => setForecastMethod(event.target.value)}>
+                    <option value="smart">智能算法预估</option>
+                    <option value="avg">对等日均值预估</option>
+                  </select>
+                  <ChevronDown size={14} />
+                </div>
+              </div>
+
+              <div className="forecast-control-item forecast-dimension-item">
+                <div className="forecast-dimension-switch" role="tablist" aria-label="预估维度切换">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={forecastDimension === 'dish'}
+                    className={forecastDimension === 'dish' ? 'forecast-dimension-btn active' : 'forecast-dimension-btn'}
+                    onClick={() => setForecastDimension('dish')}
+                  >
+                    菜品
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={forecastDimension === 'item'}
+                    className={forecastDimension === 'item' ? 'forecast-dimension-btn active' : 'forecast-dimension-btn'}
+                    onClick={() => setForecastDimension('item')}
+                  >
+                    物品
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -771,7 +1239,7 @@ function App() {
               <div className="dropdown-item">
                 <span className="dropdown-label">目标预估日期</span>
                 <div className="select-wrap">
-                  <select value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)}>
+                  <select value={selectedDate} onChange={handleForecastDateChange}>
                     {DATE_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
                         {option.label}
@@ -781,7 +1249,7 @@ function App() {
                   <ChevronDown size={14} />
                 </div>
               </div>
-              <button type="button" className="btn-primary generate-btn" onClick={handleGenerateForecastRevenue}>
+              <button type="button" className="btn-primary generate-btn" onClick={handleGenerateForecastRevenue} disabled={!forecastEditing}>
                 生成预估营业额
               </button>
             </div>
@@ -804,33 +1272,35 @@ function App() {
                     <td>
                       <input
                         className="table-input"
-                        type="number"
-                        min="0"
+                        type="text"
+                        inputMode="decimal"
                         readOnly={!forecastEditing}
                         value={lunchDraft}
-                        onChange={(event) => setLunchDraft(event.target.value)}
+                        onChange={(event) => handleSlotRevenueChange(event.target.value, dinnerDraft)}
+                        onBlur={handleSlotRevenueBlur}
                       />
                     </td>
                     <td>
                       <input
                         className="table-input"
-                        type="number"
-                        min="0"
+                        type="text"
+                        inputMode="decimal"
                         readOnly={!forecastEditing}
                         value={dinnerDraft}
-                        onChange={(event) => setDinnerDraft(event.target.value)}
+                        onChange={(event) => handleSlotRevenueChange(lunchDraft, event.target.value)}
+                        onBlur={handleSlotRevenueBlur}
                       />
                     </td>
                     <td>{systemForecastRevenue}</td>
                     <td>
                       <input
                         className="table-input"
-                        type="number"
-                        min="0"
-                        step="0.01"
+                        type="text"
+                        inputMode="decimal"
                         readOnly={!forecastEditing}
                         value={revenueFactor}
-                        onChange={(event) => setRevenueFactor(event.target.value)}
+                        onChange={(event) => handleRevenueFactorChange(event.target.value)}
+                        onBlur={handleRevenueFactorBlur}
                       />
                     </td>
                     <td>{forecastRevenueTotal}</td>
@@ -840,11 +1310,62 @@ function App() {
             </div>
 
             <div className="forecast-step-row">
-              <div className="forecast-step-title">第二步：预估销量/用量</div>
-              <button type="button" className="info-btn" aria-label="查看第二步说明" onClick={() => openInfoModal('step2')}>
-                <Info size={14} />
+              <div className="forecast-step-title-wrap">
+                <div className="forecast-step-title">第二步：预估销量/用量</div>
+                <button type="button" className="info-btn" aria-label="查看第二步说明" onClick={() => openInfoModal('step2')}>
+                  <Info size={14} />
+                </button>
+              </div>
+            </div>
+
+            <div className="forecast-actions-row">
+              <button type="button" className="btn-primary generate-btn" onClick={handleGenerateForecastQty} disabled={!forecastEditing}>
+                生成预估销量/用量
+              </button>
+              <button type="button" className="btn-subtle compact" onClick={() => setForecastFilterOpen((prev) => !prev)}>
+                {forecastFilterOpen ? '收起筛选' : '筛选'}
               </button>
             </div>
+            {forecastQtyNeedsRegenerate && <p className="hint-text danger">营业额已变更，请重新生成预估销量/用量</p>}
+
+            {forecastFilterOpen && (
+              <>
+                <div className="forecast-filter-grid compact forecast-filter-panel">
+                  <label className="forecast-filter-item compact">
+                    <span>{forecastCategoryLabel}名称</span>
+                    <input
+                      className="number-input compact"
+                      placeholder={`请输入${forecastCategoryLabel}名称`}
+                      value={forecastNameKeyword}
+                      onChange={(event) => setForecastNameKeyword(event.target.value)}
+                    />
+                  </label>
+                  <label className="forecast-filter-item compact">
+                    <span>{forecastCategoryLabel}编码</span>
+                    <input
+                      className="number-input compact"
+                      placeholder={`请输入${forecastCategoryLabel}编码`}
+                      value={forecastCodeKeyword}
+                      onChange={(event) => setForecastCodeKeyword(event.target.value)}
+                    />
+                  </label>
+                  <label className="forecast-filter-item compact">
+                    <span>{forecastCategoryLabel}助记码</span>
+                    <input
+                      className="number-input compact"
+                      placeholder={`请输入${forecastCategoryLabel}助记码`}
+                      value={forecastMnemonicKeyword}
+                      onChange={(event) => setForecastMnemonicKeyword(event.target.value)}
+                    />
+                  </label>
+                </div>
+                <div className="forecast-filter-actions">
+                  <button type="button" className="btn-subtle compact" onClick={handleResetForecastFilters}>
+                    重置筛选
+                  </button>
+                </div>
+              </>
+            )}
 
             <div className="forecast-category-tabs" role="tablist" aria-label="分类筛选">
               {forecastCategoryOptions.map((category) => (
@@ -860,54 +1381,6 @@ function App() {
                 </button>
               ))}
             </div>
-
-            <div className="forecast-actions-row">
-              <button type="button" className="btn-primary generate-btn" onClick={handleGenerateForecastQty}>
-                生成预估销量/用量
-              </button>
-              <button type="button" className="btn-subtle compact" onClick={() => setForecastFilterOpen((prev) => !prev)}>
-                {forecastFilterOpen ? '收起筛选' : '筛选'}
-              </button>
-            </div>
-
-            {forecastFilterOpen && (
-              <>
-                <div className="forecast-filter-grid compact forecast-filter-panel">
-                  <label className="forecast-filter-item compact">
-                    <span>菜品名称</span>
-                    <input
-                      className="number-input compact"
-                      placeholder="请输入菜品名称"
-                      value={forecastNameKeyword}
-                      onChange={(event) => setForecastNameKeyword(event.target.value)}
-                    />
-                  </label>
-                  <label className="forecast-filter-item compact">
-                    <span>菜品编码</span>
-                    <input
-                      className="number-input compact"
-                      placeholder="请输入菜品编码"
-                      value={forecastCodeKeyword}
-                      onChange={(event) => setForecastCodeKeyword(event.target.value)}
-                    />
-                  </label>
-                  <label className="forecast-filter-item compact">
-                    <span>菜品助记码</span>
-                    <input
-                      className="number-input compact"
-                      placeholder="请输入菜品助记码"
-                      value={forecastMnemonicKeyword}
-                      onChange={(event) => setForecastMnemonicKeyword(event.target.value)}
-                    />
-                  </label>
-                </div>
-                <div className="forecast-filter-actions">
-                  <button type="button" className="btn-subtle compact" onClick={handleResetForecastFilters}>
-                    重置筛选
-                  </button>
-                </div>
-              </>
-            )}
 
             <div className="forecast-table-wrap">
               <table className="forecast-table">
@@ -944,17 +1417,26 @@ function App() {
                         <td>
                           <input
                             className="table-input"
-                            type="number"
-                            min="0"
-                            step="0.01"
+                            type="text"
+                            inputMode="decimal"
                             readOnly={!forecastEditing}
                             value={row.factorText}
                             onChange={(event) => {
                               if (!forecastEditing) return
-                              const nextValue = event.target.value
+                              const normalizedValue = normalizeFactorDraftText(event.target.value)
+                              if (normalizedValue === null) return
+
                               setQuantityFactorMap((prev) => ({
                                 ...prev,
-                                [row.baseId]: nextValue,
+                                [row.baseId]: normalizedValue,
+                              }))
+                            }}
+                            onBlur={(event) => {
+                              if (!forecastEditing) return
+                              const normalizedValue = normalizePositiveFactorText(event.target.value)
+                              setQuantityFactorMap((prev) => ({
+                                ...prev,
+                                [row.baseId]: normalizedValue,
                               }))
                             }}
                           />
@@ -1029,6 +1511,27 @@ function App() {
               </section>
             )}
 
+            <section className="toolbar-card execution-category-card">
+              <div
+                className="forecast-category-tabs execution-category-tabs"
+                role="tablist"
+                aria-label={dimension === 'dish' ? '菜品分类筛选' : '物品分类筛选'}
+              >
+                {executionCategoryOptions.map((category) => (
+                  <button
+                    key={category.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={executionCategory === category.id}
+                    className={executionCategory === category.id ? 'forecast-category-btn active' : 'forecast-category-btn'}
+                    onClick={() => setExecutionCategory(category.id)}
+                  >
+                    {category.label}
+                  </button>
+                ))}
+              </div>
+            </section>
+
             <section className="list-panel">
               {executionRows.length === 0 ? (
                 <div className="empty-state">当前筛选条件下暂无数据</div>
@@ -1067,17 +1570,11 @@ function App() {
                         </div>
                       </div>
 
-                      {item.overQty > 0 && (
-                        <div className="over-row">
-                          已超额制备 {item.overQty}
-                          {item.unit}
-                        </div>
-                      )}
                     </article>
                   ))}
                   {hasMoreRows && (
                     <div ref={loadMoreRef} className="load-more-sentinel">
-                      继续下滑加载更多
+                      继续滑动加载更多
                     </div>
                   )}
                 </>
@@ -1122,10 +1619,10 @@ function App() {
                 <input
                   id="produce-qty-input"
                   className="number-input"
-                  type="number"
-                  min="0"
+                  type="text"
+                  inputMode="decimal"
                   value={amountInput}
-                  onChange={(event) => setAmountInput(event.target.value)}
+                  onChange={(event) => updateAmountInput(event.target.value)}
                 />
 
                 {selectedItem.type === 'item' && (
@@ -1158,10 +1655,10 @@ function App() {
                 <input
                   id="loss-qty-input"
                   className="number-input"
-                  type="number"
-                  min="0"
+                  type="text"
+                  inputMode="decimal"
                   value={amountInput}
-                  onChange={(event) => setAmountInput(event.target.value)}
+                  onChange={(event) => updateAmountInput(event.target.value)}
                 />
 
                 {selectedItem.type !== 'item' && (
@@ -1237,8 +1734,9 @@ function App() {
                       className="text-area-input"
                       rows={1}
                       placeholder="请输入备注"
+                      maxLength={20}
                       value={lossRemark}
-                      onChange={(event) => setLossRemark(event.target.value)}
+                      onChange={(event) => setLossRemark(event.target.value.slice(0, 20))}
                     />
                   </>
                 )}
